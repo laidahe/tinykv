@@ -38,22 +38,66 @@ func NewServer(storage storage.Storage) *Server {
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	reader, err := server.storage.Reader(req.GetContext())
+	resp := kvrpcpb.RawGetResponse{}
+	if err != nil {
+		return nil, err
+	}
+	val, err := reader.GetCF(req.GetCf(), req.GetKey())
+
+	if val == nil {
+		resp.NotFound = true
+	} else if err != nil {
+		resp.Error = err.Error()
+	} else {
+		resp.Value = val
+	}
+	return &resp, nil
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := kvrpcpb.RawPutResponse{}
+	m := []storage.Modify{{Data: storage.Put{Key: req.GetKey(), Value: req.GetValue(), Cf: req.GetCf()}}}
+	err := server.storage.Write(req.GetContext(), m)
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return &resp, nil
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := kvrpcpb.RawDeleteResponse{}
+	m := []storage.Modify{{Data: storage.Delete{Key: req.GetKey(), Cf: req.GetCf()}}}
+	err := server.storage.Write(req.GetContext(), m)
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return &resp, nil
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := kvrpcpb.RawScanResponse{}
+	reader, err := server.storage.Reader(req.GetContext())
+	if err != nil {
+		return nil, err
+	}
+	iter := reader.IterCF(req.GetCf())
+	iter.Seek(req.GetStartKey())
+	for count := 0; count < int(req.GetLimit()) && iter.Valid(); count++ {
+		k :=  iter.Item().KeyCopy(nil)
+		v, err := iter.Item().ValueCopy(nil)
+		if err != nil {
+			continue
+		}
+		kvp := kvrpcpb.KvPair{Key: k , Value: v}
+		resp.Kvs = append(resp.Kvs, &kvp)
+		iter.Next()
+	}
+	
+	return &resp, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
