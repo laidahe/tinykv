@@ -146,9 +146,7 @@ func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
 }
 
 func (l *RaftLog) SetCommited(index uint64) {
-	if (l.committed < index) {
-		l.committed = min(index, l.LastIndex())
-	}
+	l.committed = max(l.committed, min(index, l.LastIndex()))
 }
 
 func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {

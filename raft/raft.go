@@ -107,7 +107,6 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next   uint64
-	SendLastIndex uint64
 }
 
 type Raft struct {
@@ -240,7 +239,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 			Entries: ents,
 			Commit:  r.RaftLog.committed,
 		})
-		r.Prs[to].SendLastIndex = r.RaftLog.LastIndex()
 //	}
 	return true
 }
@@ -449,6 +447,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.RaftLog.SetCommited(m.Commit)
 	r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{
 		Reject: false,
+		Index: r.RaftLog.LastIndex(),
 	})
 }
 
@@ -459,8 +458,8 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		// send Append at now
 		r.sendAppend(m.From)
 	} else {
-		p.Match = p.SendLastIndex
-		p.Next = p.SendLastIndex + 1
+		p.Match = m.Index
+		p.Next = m.Index + 1
 		if r.checkUpdateCommit() {
 			// commit update, push to follower
 			r.sendAppendToOthers()
@@ -482,10 +481,12 @@ func (r *Raft) checkUpdateCommit() bool {
 			break
 		}
 	}
-	if newCommit - 1 == r.RaftLog.committed {
+	newCommit--
+	term, _ := r.RaftLog.Term(newCommit)
+	if newCommit == r.RaftLog.committed || term < r.Term {
 		return false
 	}
-	r.RaftLog.SetCommited(newCommit - 1)
+	r.RaftLog.SetCommited(newCommit)
 	return true
 }
 
