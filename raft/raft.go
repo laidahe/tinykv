@@ -358,6 +358,8 @@ func (r *Raft) becomeLeader() {
 	// 	Entries: []*pb.Entry{{Index: r.RaftLog.LastIndex() + 1, Term: r.Term}},
 	// })
 	r.RaftLog.Append(r.RaftLog.LastIndex(), &pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
+	// TestProgressLeader2AB need it
+	r.Prs[r.id] = &Progress{Match: r.RaftLog.LastIndex(), Next: r.RaftLog.LastIndex() + 1}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -420,6 +422,9 @@ func (r *Raft) Step(m pb.Message) error {
 				ent.Term = r.Term
 			}
 			r.RaftLog.Append(lastIndex, m.Entries...)
+			// TestProgressLeader2AB need it
+			r.Prs[r.id].Match = r.RaftLog.LastIndex()
+			r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 			r.sendAppendToOthers()
 			r.checkUpdateCommit()
 		case pb.MessageType_MsgRequestVote:
