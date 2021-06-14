@@ -371,7 +371,7 @@ func (r *Raft) Step(m pb.Message) error {
 
 	higherLogTerm := func(m pb.Message, equal bool) bool {
 		if m.Term > r.Term || (equal && m.Term == r.Term) {
-			r.becomeFollower(m.Term, m.From)
+			r.becomeFollower(m.Term, None)
 			return true
 		}
 		return false
@@ -386,11 +386,13 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgHeartbeat:
+			r.Lead = m.From
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
 			r.sendVotesToOthers()
 		case pb.MessageType_MsgAppend:
+			r.Lead = m.From
 			r.handleAppendEntries(m)
 		}
 
