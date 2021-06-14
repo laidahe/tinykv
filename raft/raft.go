@@ -357,9 +357,11 @@ func (r *Raft) becomeLeader() {
 	// r.sendMessage(r.id, pb.MessageType_MsgPropose, pb.Message{
 	// 	Entries: []*pb.Entry{{Index: r.RaftLog.LastIndex() + 1, Term: r.Term}},
 	// })
-	r.RaftLog.Append(r.RaftLog.LastIndex(), &pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
-	// TestProgressLeader2AB need it
+	// r.Prs[r.id] = &Progress{}
 	r.Prs[r.id] = &Progress{Match: r.RaftLog.LastIndex(), Next: r.RaftLog.LastIndex() + 1}
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
+	// r.RaftLog.Append(r.RaftLog.LastIndex(), &pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
+	// TestProgressLeader2AB need it
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -469,7 +471,6 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			// commit update, push to follower
 			r.sendAppendToOthers()
 		}
-		
 	}
 }
 
