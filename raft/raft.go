@@ -164,7 +164,6 @@ type Raft struct {
 	peers []uint64
 	// ticks
 	ticks   int
-	voteCnt int
 }
 
 func PanicErr(err error) {
@@ -316,8 +315,19 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 }
 
 func (r *Raft) checkVote() {
-	if r.voteCnt > len(r.peers)/2 {
-		r.becomeLeader()
+	if len(r.votes) > len(r.peers) / 2 {
+		voteCnt := 0
+		for _, vote := range r.votes {
+			if vote {
+				voteCnt++
+			}
+		}
+		reject := len(r.votes) - voteCnt
+		if voteCnt > len(r.peers) / 2 {
+			r.becomeLeader()
+		} else if reject > len(r.peers) / 2 {
+			r.becomeFollower(r.Term, None)
+		}
 	}
 }
 
@@ -327,7 +337,6 @@ func (r *Raft) becomeCandidate() {
 	r.Term++
 	r.State = StateCandidate
 	r.votes = make(map[uint64]bool)
-	r.voteCnt = 1
 	r.votes[r.id] = true
 	resetElapsed(&r.electionElapsed, &r.ticks, r.electionTimeout, true)
 	r.checkVote()
@@ -531,14 +540,8 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 }
 
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
-	if !m.Reject {
-		_, exist := r.votes[m.From]
-		r.votes[m.From] = !m.Reject
-		if !exist {
-			r.voteCnt++
-			r.checkVote()
-		}
-	}
+	r.votes[m.From] = !m.Reject
+	r.checkVote()
 }
 
 // handleSnapshot handle Snapshot RPC request
