@@ -455,7 +455,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	r.RaftLog.Append(m.Index, m.Entries...)
-	r.RaftLog.SetCommited(m.Commit)
+	var lastNewCommit uint64
+	if len(m.Entries) > 0 {
+		lastNewCommit = m.Entries[len(m.Entries) - 1].Index
+	} else {
+		lastNewCommit = m.Index
+	}
+	r.RaftLog.SetCommited(min(m.Commit, lastNewCommit))
 	r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{
 		Reject: false,
 		Index: r.RaftLog.LastIndex(),
