@@ -417,6 +417,10 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		case pb.MessageType_MsgBeat:
 			r.sendHeartBeatToOthers()
+		case pb.MessageType_MsgHeartbeatResponse:
+			if m.Commit < r.RaftLog.committed {
+				r.sendAppend(m.From)
+			}
 		case pb.MessageType_MsgPropose:
 			lastIndex := r.RaftLog.LastIndex()
 			for i, ent := range m.Entries {
@@ -500,7 +504,7 @@ func (r *Raft) checkUpdateCommit() bool {
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	resetElapsed(&r.electionElapsed, &r.ticks, r.electionTimeout, true)
-	r.sendMessage(m.From, pb.MessageType_MsgHeartbeatResponse, pb.Message{})
+	r.sendMessage(m.From, pb.MessageType_MsgHeartbeatResponse, pb.Message{Commit: r.RaftLog.committed})
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
