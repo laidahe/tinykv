@@ -50,6 +50,7 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	readyUpdated bool
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -143,10 +144,30 @@ func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
 	for _, ent := range ents {
 		l.entries = append(l.entries, *ent)
 	}
+	l.readyUpdated = true
 }
 
 func (l *RaftLog) SetCommited(index uint64) {
 	l.committed = max(l.committed, min(index, l.LastIndex()))
+	if l.committed > l.applied {
+		l.readyUpdated = true
+	}
+}
+
+func CopyEntsFromPtr(ents []*pb.Entry) []pb.Entry {
+	ret := make([]pb.Entry, 0)
+	for _, ent := range ents {
+		ret = append(ret, *ent)
+	}
+	return ret
+}
+
+func NewEntsPtr(ents []pb.Entry) []*pb.Entry {
+	ret := make([]*pb.Entry, 0)
+	for _, ent := range ents {
+		ret = append(ret, &ent)
+	}
+	return ret
 }
 
 func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
@@ -165,6 +186,23 @@ func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
 func (l *RaftLog) GetUncommit() []pb.Entry {
 	index := l.findIndex(l.committed + 1)
 	return l.entries[index:]
+}
+
+func (l *RaftLog) GetNewCommit() []pb.Entry {
+	return CopyEntsFromPtr(l.GetEntries(l.applied + 1, l.committed + 1))
+}
+
+func (l *RaftLog) CommitSubmited(ents *[]pb.Entry) {
+	if (len(*ents) == 0) {
+		return
+	}
+	l.applied = max(l.applied, (*ents)[len(*ents) - 1].Index)
+	l.readyUpdated = false
+}
+
+func (l *RaftLog) SetStabled(stabled uint64) {
+	l.stabled = max(l.stabled, stabled)
+	l.readyUpdated = false
 }
 
 // LastIndex return the last index of the log entries

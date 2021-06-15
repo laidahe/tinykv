@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"reflect"
 
 	"math/rand"
 
@@ -164,6 +165,9 @@ type Raft struct {
 	peers []uint64
 	// ticks
 	ticks   int
+	readyUpdated bool
+	*SoftState
+	pb.HardState
 }
 
 func PanicErr(err error) {
@@ -187,6 +191,7 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	hardState, _, err := c.Storage.InitialState()
+	
 	PanicErr(err)
 	raftLog := newLog(c.Storage)
 	raftLog.applied = c.Applied
@@ -202,12 +207,15 @@ func newRaft(c *Config) *Raft {
 		Vote:             hardState.Vote,
 		Term:             hardState.Term,
 		Prs:              make(map[uint64]*Progress),
+		SoftState: &SoftState{Lead: None, RaftState: StateFollower},
+		HardState: hardState,
 	}
 
 	return raft
 }
 
 func (r *Raft) sendMessage(to uint64, MsgType pb.MessageType, m pb.Message) {
+	r.readyUpdated = true
 	m.From = r.id
 	m.Term = r.Term
 	m.To = to
@@ -307,6 +315,7 @@ func (r *Raft) tick() {
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.readyUpdated = true
 	r.State = StateFollower
 	r.Term = term
 	r.Lead = lead
@@ -334,6 +343,7 @@ func (r *Raft) checkVote() {
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.readyUpdated = true
 	r.Term++
 	r.State = StateCandidate
 	r.votes = make(map[uint64]bool)
@@ -346,6 +356,7 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.readyUpdated = true
 	r.State = StateLeader
 	resetElapsed(&r.heartbeatElapsed, &r.ticks, r.heartbeatTimeout, false)
 
@@ -535,6 +546,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		Reject: reject,
 	})
 	if !reject {
+		r.readyUpdated = true
 		r.Vote = m.From
 	}
 }
@@ -542,6 +554,49 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	r.votes[m.From] = !m.Reject
 	r.checkVote()
+}
+
+func (r *Raft) HandleAdvance(rd Ready) {
+	r.readyUpdated = false
+	r.msgs = make([]pb.Message, 0)
+	r.RaftLog.CommitSubmited(&rd.CommittedEntries)
+	if len(rd.Entries) > 0 {
+		r.RaftLog.SetStabled(rd.Entries[len(rd.Entries) - 1].Index)
+	}
+	r.SoftState = rd.SoftState
+	r.HardState = rd.HardState
+}
+
+func (r *Raft) ReadyUpdated() bool {
+	return r.readyUpdated || r.RaftLog.readyUpdated
+}
+
+
+func (r *Raft) newSoftState() *SoftState {
+	return &SoftState{
+		Lead: r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) newHardState() pb.HardState {
+	return pb.HardState{
+		Term: r.Term,
+		Vote: r.Vote,
+		Commit: r.Commit,
+	}
+}
+
+func (r *Raft) GetReadyState() (*SoftState, pb.HardState) {
+	soft := r.newSoftState()
+	hard := r.newHardState()
+	if *soft == *r.SoftState {
+		soft = nil
+	}
+	if reflect.DeepEqual(hard, r.HardState) {
+		hard = pb.HardState{}
+	}
+	return soft, hard
 }
 
 // handleSnapshot handle Snapshot RPC request
