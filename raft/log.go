@@ -81,20 +81,36 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
-func (l *RaftLog) findIndex(entIndex uint64) int {
+const (
+	EqLess = 0
+	EqGreater = 1
+)
+
+func (l *RaftLog) findPos(entIndex uint64, option int) int {
 	for index, entry := range l.entries {
-		if (entry.Index >= entIndex) {
+		if entry.Index == entIndex {
 			return index
 		}
+		if entry.Index > entIndex {
+			if option == EqLess {
+				return index - 1
+			} else {
+				return index
+			}
+		}
 	}
-	return len(l.entries)
+	if option == EqLess {
+		return len(l.entries) - 1
+	} else {
+		return len(l.entries)
+	}
 }
 
 func (l *RaftLog) EntryMatch(entTerm, entIndex uint64) bool {
 	if entIndex == 0 && entTerm == 0 {
 		return true
 	}
-	index := l.findIndex(entIndex)
+	index := l.findPos(entIndex, EqGreater)
 	if (index >= len(l.entries)) {
 		return false
 	}
@@ -122,7 +138,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 }
 
 func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
-	index := l.findIndex(prevIndex + 1)
+	index := l.findPos(prevIndex + 1, EqGreater)
 	// skip exist element
 	for ; len(ents) > 0 && index < len(l.entries); index++ {
 		if l.entries[index].Index != ents[0].Index ||
@@ -136,7 +152,7 @@ func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
 		return
 	}
 
-	stabledIndex := l.findIndex(l.stabled)
+	stabledIndex := l.findPos(l.stabled, EqGreater)
 	l.entries = l.entries[:index]
 	if stabledIndex >= index {
 		l.stabled = l.LastIndex()
@@ -174,8 +190,8 @@ func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
 	if (startIndex > upperIndex) {
 		return []*pb.Entry{}
 	}
-	lower := l.findIndex(startIndex)
-	upper := l.findIndex(upperIndex)
+	lower := l.findPos(startIndex, EqGreater)
+	upper := l.findPos(upperIndex, EqGreater)
 	ret := make([]*pb.Entry, upper - lower)
 	for i := lower; i < upper; i++ {
 		ret[i - lower] = &l.entries[i]
@@ -184,7 +200,7 @@ func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
 }
 
 func (l *RaftLog) GetUncommit() []pb.Entry {
-	index := l.findIndex(l.committed + 1)
+	index := l.findPos(l.committed + 1, EqGreater)
 	return l.entries[index:]
 }
 
@@ -202,7 +218,15 @@ func (l *RaftLog) CommitSubmited(ents *[]pb.Entry) {
 
 func (l *RaftLog) SetStabled(stabled uint64) {
 	l.stabled = max(l.stabled, stabled)
-	l.readyUpdated = false
+	index := l.findPos(l.stabled, EqLess)
+	if index < 0 {
+		l.stabled = 0
+	} else {
+		l.stabled = l.entries[index].Index
+	}
+	if l.stabled == stabled {
+		l.readyUpdated = false
+	}
 }
 
 // LastIndex return the last index of the log entries
