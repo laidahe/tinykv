@@ -20,6 +20,7 @@ import (
 
 	"math/rand"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -190,26 +191,36 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, _, err := c.Storage.InitialState()
-	
+	hardState, conf, err := c.Storage.InitialState()
 	PanicErr(err)
 	raftLog := newLog(c.Storage)
 	raftLog.applied = c.Applied
 	//snapshot, err := c.Storage.Snapshot()
-
+	Prs := make(map[uint64]*Progress)
+	for _, id := range conf.Nodes {
+		Prs[id] = &Progress{}
+	}
+	var peers []uint64
+	if c.peers == nil {
+		peers = conf.GetNodes()
+	} else {
+		// For project2a
+		peers = c.peers
+	}
 	raft := &Raft{
 		id:               c.ID,
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
-		peers:            c.peers,
+		peers:            peers,
 		RaftLog:          raftLog,
 		State:            StateFollower,
 		Vote:             hardState.Vote,
 		Term:             hardState.Term,
-		Prs:              make(map[uint64]*Progress),
+		Prs:              Prs,
 		SoftState: &SoftState{Lead: None, RaftState: StateFollower},
 		HardState: hardState,
 	}
+	resetElapsed(&raft.electionElapsed, &raft.ticks, raft.electionTimeout, true)
 
 	return raft
 }
@@ -303,6 +314,7 @@ func (r *Raft) tick() {
 		}
 	case StateFollower:
 		if r.ticks == r.electionElapsed {
+			log.Infof("%d new election", r.id)
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 		}
 	case StateCandidate:
@@ -333,6 +345,7 @@ func (r *Raft) checkVote() {
 		}
 		reject := len(r.votes) - voteCnt
 		if voteCnt > len(r.peers) / 2 {
+			log.Infof("%d voteCnt=%d, -> Leader", r.id, voteCnt)
 			r.becomeLeader()
 		} else if reject > len(r.peers) / 2 {
 			r.becomeFollower(r.Term, None)
@@ -563,8 +576,12 @@ func (r *Raft) HandleAdvance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		r.RaftLog.SetStabled(rd.Entries[len(rd.Entries) - 1].Index)
 	}
-	r.SoftState = rd.SoftState
-	r.HardState = rd.HardState
+	if rd.SoftState != nil {
+		r.SoftState = rd.SoftState
+	}
+	if !reflect.DeepEqual(rd.HardState, pb.HardState{}) {
+		r.HardState = rd.HardState
+	}
 }
 
 func (r *Raft) ReadyUpdated() bool {
@@ -590,13 +607,17 @@ func (r *Raft) newHardState() pb.HardState {
 func (r *Raft) GetReadyState() (*SoftState, pb.HardState) {
 	soft := r.newSoftState()
 	hard := r.newHardState()
-	if *soft == *r.SoftState {
+	if reflect.DeepEqual(soft, r.SoftState) {
 		soft = nil
 	}
 	if reflect.DeepEqual(hard, r.HardState) {
 		hard = pb.HardState{}
 	}
 	return soft, hard
+}
+
+func (r *Raft) GetID() uint64 {
+	return r.id
 }
 
 // handleSnapshot handle Snapshot RPC request

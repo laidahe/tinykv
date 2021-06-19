@@ -3,6 +3,7 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -352,7 +353,9 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if err := ps.Append(ready.Entries, raftWB); err != nil {
 		return nil, err
 	}
-	ps.raftState.HardState = &ready.HardState
+	if !reflect.DeepEqual(ready.HardState, eraftpb.HardState{}) {
+		ps.raftState.HardState = &ready.HardState
+	}
 	if len(ready.CommittedEntries) > 0 {
 		ps.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries) - 1].Index
 	}

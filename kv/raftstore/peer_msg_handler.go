@@ -9,6 +9,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
@@ -43,6 +44,96 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	ready := d.RaftGroup.Ready()
+	
+	d.peerStorage.SaveReadyState(&ready)
+	d.Send(d.ctx.trans, ready.Messages)
+	for _, ent := range ready.CommittedEntries {
+		reqs := new(raft_cmdpb.RaftCmdRequest)
+		reqs.Unmarshal(ent.Data)
+		cb := d.getCallback(ent.Index, ent.Term)
+		//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
+		resps := d.execute(reqs.Requests, cb)
+		if cb != nil && resps != nil {
+			cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
+		}
+	}
+	d.RaftGroup.Advance(ready)
+}
+
+func (d *peerMsgHandler) getCallback(index, term uint64) *message.Callback {
+	prop := make([]*proposal, 0)
+	for i, _ := range d.proposals {
+		if d.proposals[i].index == index {
+			if d.proposals[i].term == term {
+				return d.proposals[i].cb
+			} else {
+				d.proposals[i].cb.Done(ErrRespStaleCommand(d.RaftGroup.Raft.Term))
+			}
+		} else {
+			prop = append(prop, d.proposals[i])
+		}
+	}
+	d.proposals = prop
+	return nil
+}
+
+func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callback) [] *raft_cmdpb.Response {
+	resps := make([]*raft_cmdpb.Response, 0)
+	kvWB := new(engine_util.WriteBatch)
+	for _, req := range reqs {
+		log.Infof("%d apply cmd=%+v\n", d.RaftGroup.Raft.GetID(), req)
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			get := req.GetGet()
+			txn := d.ctx.engine.Kv.NewTransaction(false)
+			val, err := engine_util.GetCFFromTxn(txn, get.GetCf(), get.GetKey())
+			if err != nil {
+				log.Infof("Get key %s not found", req.Get.Key)
+				if cb != nil {
+					cb.Done(ErrResp(&util.ErrKeyNotInRegion{
+						Key: get.GetKey(),
+						Region: d.Region(),
+					}))
+				}
+				return nil
+			} else {
+				log.Infof("Get key %s value %v", req.Get.GetKey(), val)
+				resps = append(resps, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get: &raft_cmdpb.GetResponse{
+						Value: val,
+					},
+				})
+			}
+		case raft_cmdpb.CmdType_Put:
+			put := req.GetPut()
+			kvWB.SetCF(put.GetCf(), put.GetKey(), put.GetValue())
+			resps = append(resps, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put,
+				Put: &raft_cmdpb.PutResponse{},
+			})
+		case raft_cmdpb.CmdType_Delete:
+			Del := req.GetDelete()
+			kvWB.DeleteCF(Del.GetCf(), Del.GetKey())
+			resps = append(resps, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete,
+				Delete: &raft_cmdpb.DeleteResponse{},
+			})
+		case raft_cmdpb.CmdType_Snap:
+			resps = append(resps, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap: &raft_cmdpb.SnapResponse{
+					Region: d.Region(),
+				},
+			})
+			if cb != nil {
+				cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(true)
+			}
+		}
+	}
+	d.peerStorage.Engines.WriteKV(kvWB)
+	return resps
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +205,22 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	if !d.IsLeader() {
+		cb.Done(ErrResp(&util.ErrNotLeader{
+			RegionId: d.regionId,
+			Leader: d.getPeerFromCache(d.LeaderId())}))
+		return
+	}
+
+	data, _ := msg.Marshal()
+	d.RaftGroup.Propose(data)
+	index := d.RaftGroup.Raft.RaftLog.LastIndex()
+	term := d.RaftGroup.Raft.GetTerm()
+	d.proposals = append(d.proposals, &proposal{
+		index: index,
+		term: term,
+		cb: cb,
+	})
 }
 
 func (d *peerMsgHandler) onTick() {
