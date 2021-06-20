@@ -85,10 +85,11 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 		return nil, err
 	}
 	iter := reader.IterCF(req.GetCf())
+	defer iter.Close()
 	iter.Seek(req.GetStartKey())
 	for count := 0; count < int(req.GetLimit()) && iter.Valid(); count++ {
-		k :=  iter.Item().KeyCopy(nil)
-		v, err := iter.Item().ValueCopy(nil)
+		k :=  iter.Item().Key()
+		v, err := iter.Item().Value()
 		if err != nil {
 			continue
 		}

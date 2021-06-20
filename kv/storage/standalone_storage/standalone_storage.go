@@ -15,7 +15,7 @@ import (
 type StandAloneStorage struct {
 	// Your Data Here (1).
 	db *badger.DB
-	transactions []*badger.Txn
+	readers []*StandAloneStorageReader
 }
 
 func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
@@ -23,6 +23,7 @@ func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
 	storage := StandAloneStorage{}
 	os.MkdirAll(conf.DBPath, os.ModePerm)
 	storage.db = engine_util.CreateDB(conf.DBPath, conf.Raft)
+	storage.readers = make([]*StandAloneStorageReader, 0)
 	return &storage
 }
 
@@ -33,14 +34,17 @@ func (s *StandAloneStorage) Start() error {
 
 func (s *StandAloneStorage) Stop() error {
 	// Your Code Here (1).
-	return nil
+	for i, _ := range s.readers {
+		s.readers[i].Close()
+	}
+	return s.db.Close()
 }
 
 func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, error) {
 	// Your Code Here (1).
 	txn := s.db.NewTransaction(false)
-	s.transactions = append(s.transactions, txn)
 	r := NewStandAloneStorageReader(txn)
+	s.readers = append(s.readers, &r)
 	return &r, nil
 }
 
