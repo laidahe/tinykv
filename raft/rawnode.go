@@ -147,15 +147,19 @@ func (rn *RawNode) Step(m pb.Message) error {
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
 	soft, hard := rn.Raft.GetReadyState()
+	snapshot := pb.Snapshot{}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	return Ready{
 		SoftState: soft,
 		HardState: hard,
 		Entries: CopyEntsFromPtr(
 			rn.Raft.RaftLog.GetEntries(
 				rn.Raft.RaftLog.stabled + 1, rn.Raft.RaftLog.LastIndex() + 1)),
-		//Snapshot: *rn.Raft.RaftLog.pendingSnapshot,
 		CommittedEntries: rn.Raft.RaftLog.GetNewCommit(),
 		Messages: rn.Raft.msgs,
+		Snapshot: snapshot,
 	}
 }
 

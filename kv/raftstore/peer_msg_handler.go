@@ -45,20 +45,35 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	// Your Code Here (2B).
 	ready := d.RaftGroup.Ready()
-	
+	trySnap := false
 	d.peerStorage.SaveReadyState(&ready)
 	d.Send(d.ctx.trans, ready.Messages)
 	for _, ent := range ready.CommittedEntries {
 		reqs := new(raft_cmdpb.RaftCmdRequest)
 		reqs.Unmarshal(ent.Data)
-		cb := d.getCallback(ent.Index, ent.Term)
-		//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
-		resps := d.execute(reqs.Requests, cb)
-		if cb != nil && resps != nil {
-			cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
+		if reqs.AdminRequest == nil {
+			cb := d.getCallback(ent.Index, ent.Term)
+			//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
+			resps := d.execute(reqs.Requests, cb)
+			if cb != nil && resps != nil {
+				cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
+			}
+		} else {
+			switch reqs.AdminRequest.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				trySnap = true
+				d.ScheduleCompactLog(reqs.AdminRequest.CompactLog.CompactIndex)
+				d.peerStorage.applyState.TruncatedState = 
+				&rspb.RaftTruncatedState{Index: reqs.AdminRequest.CompactLog.CompactIndex,
+					Term: reqs.AdminRequest.CompactLog.CompactTerm}
+			}
 		}
+		
 	}
 	d.RaftGroup.Advance(ready)
+	if trySnap {
+		d.RaftGroup.Raft.TrySnapshot()
+	}
 }
 
 func (d *peerMsgHandler) getCallback(index, term uint64) *message.Callback {

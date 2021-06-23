@@ -3,7 +3,6 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -340,7 +339,28 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if len(snapData.Data) == 0 {
+		return nil, nil
+	}
+	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: snapshot.Metadata.Index, Term: snapshot.Metadata.Term}
+	err := ps.clearMeta(kvWB, raftWB)
+	if err != nil {
+		return nil, err
+	}
+	ps.clearExtraData(snapData.GetRegion())
+	oldRegion :=  ps.region
+	ps.region = snapData.GetRegion()
+	oldState := ps.snapState.StateType
+	ps.snapState.StateType = snap.SnapState_Applying
+	ch := make(chan bool, 0)
+	ps.regionSched <- runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+	}
+	<- ch
+	ps.snapState.StateType = oldState
+	return &ApplySnapResult{oldRegion, ps.region}, nil
 }
 
 // Save memory states to disk.
@@ -353,11 +373,15 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if err := ps.Append(ready.Entries, raftWB); err != nil {
 		return nil, err
 	}
-	if !reflect.DeepEqual(ready.HardState, eraftpb.HardState{}) {
+	if ready.HardState.Term > 0 {
 		ps.raftState.HardState = &ready.HardState
 	}
 	if len(ready.CommittedEntries) > 0 {
 		ps.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries) - 1].Index
+	}
+	result, err := ps.ApplySnapshot(&ready.Snapshot, raftWB, kvWB)
+	if err != nil {
+		return nil, err
 	}
 	reginState := &rspb.RegionLocalState{State: rspb.PeerState_Normal, Region: ps.region}
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()),  ps.raftState)
@@ -366,7 +390,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	ps.Engines.WriteRaft(raftWB)
 	ps.Engines.WriteKV(kvWB)
 	
-	return nil, nil
+	return result, nil
 }
 
 func (ps *PeerStorage) ClearData() {

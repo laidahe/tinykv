@@ -244,8 +244,16 @@ func (r *Raft) sendAppend(to uint64) bool {
 		prev := r.RaftLog.GetEntries(p.Next-1, p.Next)
 		var prevTerm, prevIndex uint64
 		if len(prev) == 0 {
-			prevTerm = 0
-			prevIndex = 0
+			prevTerm = r.RaftLog.snapIndex
+			prevIndex = r.RaftLog.snapTerm
+			// try send snapshot to follower
+			if r.RaftLog.pendingSnapshot != nil {
+				r.sendMessage(to, pb.MessageType_MsgSnapshot, pb.Message{
+					Snapshot: r.RaftLog.pendingSnapshot,
+				})
+				// for TestProvideSnap2C
+				return true
+			}
 		} else {
 			prevTerm = prev[len(prev)-1].Term
 			prevIndex = prev[len(prev)-1].Index
@@ -427,6 +435,9 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgAppend:
 			r.Lead = m.From
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgSnapshot:
+			r.Lead = m.From
+			r.handleSnapshot(m)
 		}
 
 	case StateCandidate:
@@ -515,6 +526,9 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		if r.checkUpdateCommit() {
 			// commit update, push to follower
 			r.sendAppendToOthers()
+		} else if p.Match < r.RaftLog.LastIndex() {
+			// for test TestProvideSnap2C
+			r.sendAppend(m.From)
 		}
 	}
 }
@@ -571,6 +585,7 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 
 func (r *Raft) HandleAdvance(rd Ready) {
 	r.readyUpdated = false
+	r.RaftLog.readyUpdated = false
 	r.msgs = make([]pb.Message, 0)
 	r.RaftLog.CommitSubmited(&rd.CommittedEntries)
 	if len(rd.Entries) > 0 {
@@ -620,9 +635,45 @@ func (r *Raft) GetID() uint64 {
 	return r.id
 }
 
+func (r *Raft) TrySnapshot() {
+	r.RaftLog.maybeCompact()
+	if r.RaftLog.pendingSnapshot == nil {
+		return
+	}
+	// for _, id := range r.peers {
+	// 	if id != r.id {
+	// 		r.sendMessage(id, pb.MessageType_MsgSnapshot, pb.Message{
+	// 			Snapshot: r.RaftLog.pendingSnapshot,
+	// 		})
+	// 	}
+	// }
+	// installSnapshot for self
+	r.Step(pb.Message{
+		From: r.id,
+		To: r.id,
+		MsgType: pb.MessageType_MsgSnapshot,
+		Term: r.Term,
+		Snapshot: r.RaftLog.pendingSnapshot,
+	})
+}
+
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	//reject
+	if m.Term < r.Term {
+		r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{Reject: true})
+	}
+	r.RaftLog.InstallSnap(m.GetSnapshot())
+	r.peers = m.Snapshot.Metadata.ConfState.Nodes
+	r.Prs = make(map[uint64]*Progress, 0)
+	for _, id := range r.peers {
+		r.Prs[id] = &Progress{}
+	}
+	r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{
+		LogTerm: m.Snapshot.Metadata.Index,
+		Index: m.Snapshot.Metadata.Index,
+	})
 }
 
 // addNode add a new node to raft group

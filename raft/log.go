@@ -51,6 +51,8 @@ type RaftLog struct {
 
 	// Your Data Here (2A).
 	readyUpdated bool
+	// save snapshot's last included Term and Index
+	snapIndex, snapTerm uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -64,13 +66,29 @@ func newLog(storage Storage) *RaftLog {
 	lastIndex, err := storage.LastIndex()
 	PanicErr(err)
 	entries, err := storage.Entries(firstIndex, lastIndex + 1)
-	PanicErr(err)
+	var snapshot *pb.Snapshot = nil
+	snapIndex := uint64(0)
+	snapTerm := uint64(0)
+	if err != nil {
+		snap, err := storage.Snapshot()
+		if err == nil {
+			snapshot = &snap
+			snapIndex, snapTerm = snap.GetMetadata().Index, snap.GetMetadata().Term
+			entries, err = storage.Entries(snapIndex + 1, lastIndex + 1)
+			PanicErr(err)
+		} else {
+			entries = make([]pb.Entry, 0)
+		}
+	}
 	return &RaftLog {
 		storage: storage,
 		applied: 0,
 		committed: hardState.Commit,
 		entries: entries,
 		stabled: lastIndex,
+		snapIndex: snapIndex,
+		snapTerm: snapTerm,
+		pendingSnapshot: snapshot,
 	}
 }
 
@@ -79,6 +97,13 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	snapshot, err := l.storage.Snapshot()
+	if err != nil {
+		return
+	}
+	l.pendingSnapshot = &snapshot
+	l.snapIndex, l.snapTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
+	l.readyUpdated = true
 }
 
 const (
@@ -107,7 +132,7 @@ func (l *RaftLog) findPos(entIndex uint64, option int) int {
 }
 
 func (l *RaftLog) EntryMatch(entTerm, entIndex uint64) bool {
-	if entIndex == 0 && entTerm == 0 {
+	if entIndex == 0 && entTerm == 0 || entIndex == l.snapIndex && entTerm == l.snapTerm {
 		return true
 	}
 	index := l.findPos(entIndex, EqGreater)
@@ -161,6 +186,22 @@ func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
 		l.entries = append(l.entries, *ent)
 	}
 	l.readyUpdated = true
+}
+
+
+func (l *RaftLog) InstallSnap(snap *pb.Snapshot) {
+	if snap.Metadata.Index < l.snapIndex {
+		return
+	}
+	l.snapIndex, l.snapTerm = snap.Metadata.Index, snap.Metadata.Term
+	pos := l.findPos(l.snapIndex + 1, EqGreater)
+	// for the case which Follower install snapshot
+	l.stabled = max(l.stabled, l.snapIndex)
+	l.committed = max(l.committed, l.snapIndex)
+	l.applied = max(l.applied, l.snapIndex)
+
+	l.entries = l.entries[pos:]
+	l.pendingSnapshot = snap
 }
 
 func (l *RaftLog) SetCommited(index uint64) {
@@ -233,7 +274,7 @@ func (l *RaftLog) SetStabled(stabled uint64) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapIndex
 	}
 	return l.entries[len(l.entries) - 1].Index
 }
@@ -241,8 +282,11 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if (i == 0) {
+	if i == 0 {
 		return 0, nil
+	}
+	if i == l.snapIndex {
+		return l.snapTerm, nil
 	}
 	for _, e := range l.entries {
 		if e.Index == i {
