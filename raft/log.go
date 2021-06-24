@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -66,23 +69,32 @@ func newLog(storage Storage) *RaftLog {
 	lastIndex, err := storage.LastIndex()
 	PanicErr(err)
 	entries, err := storage.Entries(firstIndex, lastIndex + 1)
-	var snapshot *pb.Snapshot = nil
-	snapIndex := uint64(0)
-	snapTerm := uint64(0)
 	if err != nil {
-		snap, err := storage.Snapshot()
-		if err == nil {
-			snapshot = &snap
-			snapIndex, snapTerm = snap.GetMetadata().Index, snap.GetMetadata().Term
-			entries, err = storage.Entries(snapIndex + 1, lastIndex + 1)
-			PanicErr(err)
-		} else {
-			entries = make([]pb.Entry, 0)
-		}
+		log.Infof("firstIndex=%d, lastIndex=%d", firstIndex, lastIndex)
 	}
+	PanicErr(err)
+	var snapshot *pb.Snapshot = nil
+	snapIndex := firstIndex - 1
+	snapTerm, _ := storage.Term(snapIndex)
+	applied := snapIndex
+	// if err != nil {
+	// 	snap, err := storage.Snapshot()
+	// 	if err == nil {
+	// 		// snapshot exist
+	// 		log.Infof("recover from snap, snapIndex=%d snapTerm=%d lastIndex=%d", snapIndex, snapTerm, lastIndex)
+	// 		snapshot = &snap
+	// 		snapIndex, snapTerm = snap.GetMetadata().Index, snap.GetMetadata().Term
+	// 		applied = snapIndex
+	// 		// get entries following snapshot
+	// 		entries, err = storage.Entries(snapIndex + 1, lastIndex + 1)
+	// 		PanicErr(err)
+	// 	} else {
+	// 		entries = make([]pb.Entry, 0)
+	// 	}
+	// }
 	return &RaftLog {
 		storage: storage,
-		applied: 0,
+		applied: applied,
 		committed: hardState.Commit,
 		entries: entries,
 		stabled: lastIndex,
@@ -107,8 +119,9 @@ func (l *RaftLog) maybeCompact() {
 }
 
 const (
-	EqLess = 0
-	EqGreater = 1
+	EqLastLess = 0
+	EqFirstGreater = 1
+	Eq = 2
 )
 
 func (l *RaftLog) findPos(entIndex uint64, option int) int {
@@ -117,17 +130,24 @@ func (l *RaftLog) findPos(entIndex uint64, option int) int {
 			return index
 		}
 		if entry.Index > entIndex {
-			if option == EqLess {
+			switch option {
+			case EqLastLess:
 				return index - 1
-			} else {
+			case EqFirstGreater:
 				return index
+			case Eq:
+				return -1
 			}
 		}
 	}
-	if option == EqLess {
+
+	switch option {
+	case EqLastLess:
 		return len(l.entries) - 1
-	} else {
+	case EqFirstGreater:
 		return len(l.entries)
+	default:
+		return -1
 	}
 }
 
@@ -135,7 +155,7 @@ func (l *RaftLog) EntryMatch(entTerm, entIndex uint64) bool {
 	if entIndex == 0 && entTerm == 0 || entIndex == l.snapIndex && entTerm == l.snapTerm {
 		return true
 	}
-	index := l.findPos(entIndex, EqGreater)
+	index := l.findPos(entIndex, EqFirstGreater)
 	if (index >= len(l.entries)) {
 		return false
 	}
@@ -146,7 +166,7 @@ func (l *RaftLog) EntryMatch(entTerm, entIndex uint64) bool {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	ret := make([]pb.Entry, 0)
-	for _, ent := range l.GetEntries(l.stabled + 1, l.LastIndex() + 1) {
+	for _, ent := range l.GetEntries(l.stabled + 1, l.LastIndex() + 1, false) {
 		ret = append(ret, *ent)
 	}
 	return ret
@@ -156,14 +176,14 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	ret := make([]pb.Entry, 0)
-	for _, ent := range l.GetEntries(l.applied + 1, l.committed + 1) {
+	for _, ent := range l.GetEntries(l.applied + 1, l.committed + 1, false) {
 		ret = append(ret, *ent)
 	}
 	return ret
 }
 
 func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
-	index := l.findPos(prevIndex + 1, EqGreater)
+	index := l.findPos(prevIndex + 1, EqFirstGreater)
 	// skip exist element
 	for ; len(ents) > 0 && index < len(l.entries); index++ {
 		if l.entries[index].Index != ents[0].Index ||
@@ -177,7 +197,7 @@ func (l *RaftLog) Append(prevIndex uint64, ents ...*pb.Entry) {
 		return
 	}
 
-	stabledIndex := l.findPos(l.stabled, EqGreater)
+	stabledIndex := l.findPos(l.stabled, EqFirstGreater)
 	l.entries = l.entries[:index]
 	if stabledIndex >= index {
 		l.stabled = l.LastIndex()
@@ -194,7 +214,7 @@ func (l *RaftLog) InstallSnap(snap *pb.Snapshot) {
 		return
 	}
 	l.snapIndex, l.snapTerm = snap.Metadata.Index, snap.Metadata.Term
-	pos := l.findPos(l.snapIndex + 1, EqGreater)
+	pos := l.findPos(l.snapIndex + 1, EqFirstGreater)
 	// for the case which Follower install snapshot
 	l.stabled = max(l.stabled, l.snapIndex)
 	l.committed = max(l.committed, l.snapIndex)
@@ -202,6 +222,7 @@ func (l *RaftLog) InstallSnap(snap *pb.Snapshot) {
 
 	l.entries = l.entries[pos:]
 	l.pendingSnapshot = snap
+	l.readyUpdated = true
 }
 
 func (l *RaftLog) SetCommited(index uint64) {
@@ -227,12 +248,24 @@ func NewEntsPtr(ents []pb.Entry) []*pb.Entry {
 	return ret
 }
 
-func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
+// return entries which index in (startIndex, upperIndex).
+// if mustIncludeSt=true and entry which index=startIndex doesn't exist,
+// return empty slice
+func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64, mustIncludeSt bool) []*pb.Entry {
 	if (startIndex > upperIndex) {
 		return []*pb.Entry{}
 	}
-	lower := l.findPos(startIndex, EqGreater)
-	upper := l.findPos(upperIndex, EqGreater)
+	var lower int
+	if mustIncludeSt {
+		lower = l.findPos(startIndex, EqFirstGreater)
+	} else {
+		lower = l.findPos(startIndex, Eq)
+		if lower < 0 {
+			return []*pb.Entry{}
+		}
+	}
+	
+	upper := l.findPos(upperIndex, EqFirstGreater)
 	ret := make([]*pb.Entry, upper - lower)
 	for i := lower; i < upper; i++ {
 		ret[i - lower] = &l.entries[i]
@@ -241,25 +274,27 @@ func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64) []*pb.Entry {
 }
 
 func (l *RaftLog) GetUncommit() []pb.Entry {
-	index := l.findPos(l.committed + 1, EqGreater)
+	index := l.findPos(l.committed + 1, EqFirstGreater)
 	return l.entries[index:]
 }
 
 func (l *RaftLog) GetNewCommit() []pb.Entry {
-	return CopyEntsFromPtr(l.GetEntries(l.applied + 1, l.committed + 1))
+	return CopyEntsFromPtr(l.GetEntries(l.applied + 1, l.committed + 1, false))
 }
 
 func (l *RaftLog) CommitSubmited(ents *[]pb.Entry) {
 	if (len(*ents) == 0) {
 		return
 	}
-	l.applied = max(l.applied, (*ents)[len(*ents) - 1].Index)
+	last := (*ents)[len(*ents) - 1].Index
+	l.applied = max(l.applied, last)
+	log.Infof("commit submit last index=%d applied=%d", last, l.applied)
 	l.readyUpdated = false
 }
 
 func (l *RaftLog) SetStabled(stabled uint64) {
 	l.stabled = max(l.stabled, stabled)
-	index := l.findPos(l.stabled, EqLess)
+	index := l.findPos(l.stabled, EqLastLess)
 	if index < 0 {
 		l.stabled = 0
 	} else {
@@ -274,6 +309,7 @@ func (l *RaftLog) SetStabled(stabled uint64) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
+		// maybe install snapshot before
 		return l.snapIndex
 	}
 	return l.entries[len(l.entries) - 1].Index

@@ -156,7 +156,7 @@ func (rn *RawNode) Ready() Ready {
 		HardState: hard,
 		Entries: CopyEntsFromPtr(
 			rn.Raft.RaftLog.GetEntries(
-				rn.Raft.RaftLog.stabled + 1, rn.Raft.RaftLog.LastIndex() + 1)),
+				rn.Raft.RaftLog.stabled + 1, rn.Raft.RaftLog.LastIndex() + 1, false)),
 		CommittedEntries: rn.Raft.RaftLog.GetNewCommit(),
 		Messages: rn.Raft.msgs,
 		Snapshot: snapshot,

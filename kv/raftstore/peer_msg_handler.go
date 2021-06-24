@@ -16,6 +16,8 @@ import (
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+
 )
 
 type PeerTick int
@@ -62,10 +64,15 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			switch reqs.AdminRequest.CmdType {
 			case raft_cmdpb.AdminCmdType_CompactLog:
 				trySnap = true
+				//don't forget to write DB after change val of tuancatedState!!
+				wb := engine_util.WriteBatch{}
+				d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{
+					Index: reqs.AdminRequest.CompactLog.CompactIndex,
+					Term: reqs.AdminRequest.CompactLog.CompactTerm,
+				}
+				wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+				wb.WriteToDB(d.ctx.engine.Kv)
 				d.ScheduleCompactLog(reqs.AdminRequest.CompactLog.CompactIndex)
-				d.peerStorage.applyState.TruncatedState = 
-				&rspb.RaftTruncatedState{Index: reqs.AdminRequest.CompactLog.CompactIndex,
-					Term: reqs.AdminRequest.CompactLog.CompactTerm}
 			}
 		}
 		
@@ -78,7 +85,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 func (d *peerMsgHandler) getCallback(index, term uint64) *message.Callback {
 	prop := make([]*proposal, 0)
-	for i, _ := range d.proposals {
+	for i := range d.proposals {
 		if d.proposals[i].index == index {
 			if d.proposals[i].term == term {
 				return d.proposals[i].cb

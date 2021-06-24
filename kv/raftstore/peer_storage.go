@@ -329,7 +329,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
-	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
@@ -342,7 +341,9 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if len(snapData.Data) == 0 {
 		return nil, nil
 	}
+	log.Infof("%v begin to apply snapshot", ps.Tag)
 	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: snapshot.Metadata.Index, Term: snapshot.Metadata.Term}
+	log.Infof("turncatedIndex=%d", snapshot.Metadata.Index)
 	err := ps.clearMeta(kvWB, raftWB)
 	if err != nil {
 		return nil, err
@@ -352,7 +353,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.region = snapData.GetRegion()
 	oldState := ps.snapState.StateType
 	ps.snapState.StateType = snap.SnapState_Applying
-	ch := make(chan bool, 0)
+	ch := make(chan bool)
 	ps.regionSched <- runner.RegionTaskApply{
 		RegionId: ps.region.Id,
 		Notifier: ch,
