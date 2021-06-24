@@ -206,7 +206,7 @@ func newRaft(c *Config) *Raft {
 	hardState, conf, err := c.Storage.InitialState()
 	PanicErr(err)
 	raftLog := newLog(c.Storage)
-	raftLog.applied = c.Applied
+	raftLog.applied = max(raftLog.applied, c.Applied)
 	var peers []uint64
 	if c.peers == nil {
 		peers = conf.GetNodes()

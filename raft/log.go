@@ -256,7 +256,7 @@ func (l *RaftLog) GetEntries(startIndex uint64, upperIndex uint64, mustIncludeSt
 		return []*pb.Entry{}
 	}
 	var lower int
-	if mustIncludeSt {
+	if !mustIncludeSt {
 		lower = l.findPos(startIndex, EqFirstGreater)
 	} else {
 		lower = l.findPos(startIndex, Eq)
