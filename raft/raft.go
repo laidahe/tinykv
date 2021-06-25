@@ -50,6 +50,13 @@ func (st StateType) String() string {
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
 
+// leader is changing leadership and reject propose new log entry temporarily
+var ErrLeadershipChange = errors.New("leadership changing")
+// there has been a pending conf change log entry
+var ErrPendingConfChange = errors.New("leadership changing")
+
+
+
 // Config contains the parameters to start a raft.
 type Config struct {
 	// ID is the identity of the local raft. ID cannot be 0.
@@ -126,8 +133,8 @@ type Raft struct {
 	// this peer's role
 	State StateType
 
-	// votes records
-	votes map[uint64]bool
+	// grantVotes records
+	grantVotes map[uint64]bool
 
 	// msgs need to send
 	msgs []pb.Message
@@ -245,37 +252,35 @@ func (r *Raft) sendMessage(to uint64, MsgType pb.MessageType, m pb.Message) {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	p := r.Prs[to]
-//	if p.Next <= r.RaftLog.LastIndex() {
-		ents := r.RaftLog.GetEntries(p.Next, r.RaftLog.LastIndex()+1, false)
-		prevIndex := p.Next - 1
-		prevTerm, err := r.RaftLog.Term(prevIndex)
-		if err != nil {
-			// prev entry isn't exist, maybe compact,
-			// so send snapshot
-			if r.RaftLog.pendingSnapshot == nil {
-				// maybe node restart, so get a new snapshot
-				snap, err := r.RaftLog.storage.Snapshot()
-				if err != nil {
-					return false
-				}
-				// install snapshot for self
-				r.installSnapshot(&snap)
+	ents := r.RaftLog.GetEntries(p.Next, r.RaftLog.LastIndex()+1, false)
+	prevIndex := p.Next - 1
+	prevTerm, err := r.RaftLog.Term(prevIndex)
+	if err != nil {
+		// prev entry isn't exist, maybe compact,
+		// so send snapshot
+		if r.RaftLog.pendingSnapshot == nil {
+			// maybe node restart, so get a new snapshot
+			snap, err := r.RaftLog.storage.Snapshot()
+			if err != nil {
+				return false
 			}
-			
-			r.sendMessage(to, pb.MessageType_MsgSnapshot, pb.Message{
-				Snapshot: r.RaftLog.pendingSnapshot,
-			})
-			// for TestProvideSnap2C
-			return true
+			// install snapshot for self
+			r.installSnapshot(&snap)
 		}
-
-		r.sendMessage(to, pb.MessageType_MsgAppend, pb.Message{
-			LogTerm: prevTerm,
-			Index:   prevIndex,
-			Entries: ents,
-			Commit:  r.RaftLog.committed,
+		
+		r.sendMessage(to, pb.MessageType_MsgSnapshot, pb.Message{
+			Snapshot: r.RaftLog.pendingSnapshot,
 		})
-//	}
+		// for TestProvideSnap2C
+		return true
+	}
+
+	r.sendMessage(to, pb.MessageType_MsgAppend, pb.Message{
+		LogTerm: prevTerm,
+		Index:   prevIndex,
+		Entries: ents,
+		Commit:  r.RaftLog.committed,
+	})
 	return true
 }
 
@@ -354,14 +359,14 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 }
 
 func (r *Raft) checkVote() {
-	if len(r.votes) > len(r.Prs) / 2 {
+	if len(r.grantVotes) > len(r.Prs) / 2 {
 		voteCnt := 0
-		for _, vote := range r.votes {
+		for _, vote := range r.grantVotes {
 			if vote {
 				voteCnt++
 			}
 		}
-		reject := len(r.votes) - voteCnt
+		reject := len(r.grantVotes) - voteCnt
 		if voteCnt > len(r.Prs) / 2 {
 			log.Infof("%d voteCnt=%d, -> Leader", r.id, voteCnt)
 			r.becomeLeader()
@@ -377,8 +382,8 @@ func (r *Raft) becomeCandidate() {
 	r.readyUpdated = true
 	r.Term++
 	r.State = StateCandidate
-	r.votes = make(map[uint64]bool)
-	r.votes[r.id] = true
+	r.grantVotes = make(map[uint64]bool)
+	r.grantVotes[r.id] = true
 	resetElapsed(&r.electionElapsed, &r.ticks, r.electionTimeout, true)
 	r.checkVote()
 }
@@ -403,8 +408,9 @@ func (r *Raft) becomeLeader() {
 
 	// noop entry
 	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
-	// r.RaftLog.Append(r.RaftLog.LastIndex(), &pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
-	// TestProgressLeader2AB need it
+	r.leadTransferee = 0
+	r.PendingConfIndex = 0
+	r.Lead = r.id
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -440,6 +446,13 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgSnapshot:
 			r.Lead = m.From
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			if _, exist := r.Prs[r.id]; exist {
+				r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+			}
+		case pb.MessageType_MsgTransferLeader:
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
 		}
 
 	case StateCandidate:
@@ -470,13 +483,22 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendAppend(m.From)
 			}
 		case pb.MessageType_MsgPropose:
+			if r.leadTransferee != 0 {
+				return ErrLeadershipChange
+			}
 			lastIndex := r.RaftLog.LastIndex()
 			for i, ent := range m.Entries {
 				ent.Index = uint64(i) + lastIndex + 1
 				ent.Term = r.Term
+				if ent.EntryType == pb.EntryType_EntryConfChange {
+					if r.RaftLog.applied < r.PendingConfIndex {
+						return ErrPendingConfChange
+					}
+					r.PendingConfIndex = ent.Index
+				}
 			}
 			r.RaftLog.Append(lastIndex, m.Entries...)
-			// TestProgressLeader2AB need it
+			// TestProgressLeader2AB need it, always make r.Prs[r.id].Match newest
 			r.Prs[r.id].Match = r.RaftLog.LastIndex()
 			r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 			r.sendAppendToOthers()
@@ -486,6 +508,12 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgAppendResponse:
 			r.handleAppendEntriesResponse(m)
+		case pb.MessageType_MsgTransferLeader:
+			if _, exist := r.Prs[m.From]; exist {
+				r.leadTransferee = m.From
+				r.checkTransferee()
+			}
+			
 		}
 	}
 	return nil
@@ -525,16 +553,25 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	} else {
 		p.Match = m.Index
 		p.Next = m.Index + 1
+
+		if m.From == r.leadTransferee {
+			r.checkTransferee()
+			return
+		}
+
 		if r.checkUpdateCommit() {
 			// commit update, push to follower
 			r.sendAppendToOthers()
-		} else if p.Match < r.RaftLog.LastIndex() {
+			return
+		}
+		if p.Match < r.RaftLog.LastIndex() {
 			// for test TestProvideSnap2C
 			r.sendAppend(m.From)
 		}
 	}
 }
 
+// try update commit
 func (r *Raft) checkUpdateCommit() bool {
 	newCommit := r.RaftLog.committed + 1
 	for ; newCommit <= r.RaftLog.LastIndex(); newCommit++ {
@@ -581,7 +618,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 }
 
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
-	r.votes[m.From] = !m.Reject
+	r.grantVotes[m.From] = !m.Reject
 	r.checkVote()
 }
 
@@ -674,12 +711,41 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	})
 }
 
+// check transferee 's log is up to date and return result.
+func (r *Raft) checkTransferee() bool {
+	if r.leadTransferee == 0 {
+		return false
+	}
+	p := r.Prs[r.leadTransferee]
+	if p.Match < r.RaftLog.LastIndex() {
+		r.sendAppend(r.leadTransferee)
+		return false
+	} else {
+		r.sendMessage(r.leadTransferee, pb.MessageType_MsgTimeoutNow, pb.Message{})
+		r.leadTransferee = 0
+		return true
+	}
+}
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.Prs[id] = &Progress{Match: 0, Next: r.RaftLog.LastIndex()}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+	switch r.State {
+	case StateFollower:
+		if r.Vote == id {
+			r.Vote = 0
+		}
+	case StateCandidate:
+		delete(r.grantVotes, id)
+		r.checkVote()
+	case StateLeader:
+		r.checkUpdateCommit()
+	}
 }

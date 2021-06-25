@@ -6,18 +6,18 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
-	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
-
 )
 
 type PeerTick int
@@ -51,31 +51,37 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.peerStorage.SaveReadyState(&ready)
 	d.Send(d.ctx.trans, ready.Messages)
 	for _, ent := range ready.CommittedEntries {
-		reqs := new(raft_cmdpb.RaftCmdRequest)
-		reqs.Unmarshal(ent.Data)
-		if reqs.AdminRequest == nil {
-			cb := d.getCallback(ent.Index, ent.Term)
-			//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
-			resps := d.execute(reqs.Requests, cb)
-			if cb != nil && resps != nil {
-				cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
-			}
-		} else {
-			switch reqs.AdminRequest.CmdType {
-			case raft_cmdpb.AdminCmdType_CompactLog:
-				trySnap = true
-				//don't forget to write DB after change val of tuancatedState!!
-				wb := engine_util.WriteBatch{}
-				d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{
-					Index: reqs.AdminRequest.CompactLog.CompactIndex,
-					Term: reqs.AdminRequest.CompactLog.CompactTerm,
+		switch ent.EntryType {
+		case eraftpb.EntryType_EntryNormal:
+			reqs := new(raft_cmdpb.RaftCmdRequest)
+			reqs.Unmarshal(ent.Data)
+			if reqs.AdminRequest == nil {
+				cb := d.getCallback(ent.Index, ent.Term)
+				//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
+				resps := d.execute(reqs.Requests, cb)
+				if cb != nil && resps != nil {
+					cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
 				}
-				wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-				wb.WriteToDB(d.ctx.engine.Kv)
-				d.ScheduleCompactLog(reqs.AdminRequest.CompactLog.CompactIndex)
+			} else {
+				switch reqs.AdminRequest.CmdType {
+				case raft_cmdpb.AdminCmdType_CompactLog:
+					trySnap = true
+					//don't forget to write DB after change val of tuancatedState!!
+					wb := engine_util.WriteBatch{}
+					d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{
+						Index: reqs.AdminRequest.CompactLog.CompactIndex,
+						Term: reqs.AdminRequest.CompactLog.CompactTerm,
+					}
+					wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					wb.WriteToDB(d.ctx.engine.Kv)
+					d.ScheduleCompactLog(reqs.AdminRequest.CompactLog.CompactIndex)
+				}
 			}
+		case eraftpb.EntryType_EntryConfChange:
+			cc := eraftpb.ConfChange{}
+			cc.Unmarshal(ent.Data)
+			d.RaftGroup.ApplyConfChange(cc)
 		}
-		
 	}
 	d.RaftGroup.Advance(ready)
 	if trySnap {
@@ -235,7 +241,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 
 	data, _ := msg.Marshal()
-	d.RaftGroup.Propose(data)
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
 	index := d.RaftGroup.Raft.RaftLog.LastIndex()
 	term := d.RaftGroup.Raft.GetTerm()
 	d.proposals = append(d.proposals, &proposal{
