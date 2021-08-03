@@ -69,9 +69,7 @@ func newLog(storage Storage) *RaftLog {
 	lastIndex, err := storage.LastIndex()
 	PanicErr(err)
 	entries, err := storage.Entries(firstIndex, lastIndex + 1)
-	if err != nil {
-		log.Infof("firstIndex=%d, lastIndex=%d", firstIndex, lastIndex)
-	}
+	log.Infof("firstIndex=%d, lastIndex=%d", firstIndex, lastIndex)
 	PanicErr(err)
 	var snapshot *pb.Snapshot = nil
 	snapIndex := firstIndex - 1
@@ -107,14 +105,22 @@ func newLog(storage Storage) *RaftLog {
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
-func (l *RaftLog) maybeCompact() {
+func (l *RaftLog) maybeCompact(id uint64) {
 	// Your Code Here (2C).
-	snapshot, err := l.storage.Snapshot()
-	if err != nil {
+	// remove entries index <= truncatedIndex
+	truncatedIndex, err := l.storage.FirstIndex()
+	truncatedIndex -= 1
+	if err != nil || l.snapIndex == truncatedIndex {
 		return
 	}
-	l.pendingSnapshot = &snapshot
-	l.snapIndex, l.snapTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
+	pos := l.findPos(truncatedIndex, Eq)
+	if pos == -1 {
+		return
+	}
+	log.Infof("%d compact log <= %d", id, l.snapIndex)
+	l.snapIndex, l.snapTerm = l.entries[pos].Index, l.entries[pos].Term
+	l.entries = l.entries[pos + 1:]
+	l.pendingSnapshot = nil
 	l.readyUpdated = true
 }
 
@@ -329,5 +335,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 			return e.Term, nil
 		}
 	}
+	log.Warnf("Term can't get Term %v", i)
 	return 0, ErrUnavailable
 }

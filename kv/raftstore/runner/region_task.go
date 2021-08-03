@@ -114,7 +114,8 @@ func (snapCtx *snapContext) applySnap(regionId uint64, startKey, endKey []byte, 
 		return err
 	}
 
-	log.Infof("applying new data. [regionId: %d, timeTakes: %v]", regionId, time.Now().Sub(t))
+	log.Infof("applying new data. [regionId: %d, startKey %s endKey %s, timeTakes: %v]",
+		regionId, startKey, endKey, time.Now().Sub(t))
 	return nil
 }
 

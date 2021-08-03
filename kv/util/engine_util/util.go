@@ -5,6 +5,7 @@ import (
 
 	"github.com/Connor1996/badger"
 	"github.com/golang/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/log"
 )
 
 func KeyWithCF(cf string, key []byte) []byte {
@@ -97,6 +98,7 @@ func deleteRangeCF(txn *badger.Txn, batch *WriteBatch, cf string, startKey, endK
 		if ExceedEndKey(key, endKey) {
 			break
 		}
+		log.Infof("deleteRange key %s", key)
 		batch.DeleteCF(cf, key)
 	}
 	defer it.Close()

@@ -286,17 +286,24 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 
 func (bs *Raftstore) shutDown() {
 	close(bs.closeCh)
+	log.Info("wg.wait")
 	bs.wg.Wait()
+	log.Info("tickDriver")
 	bs.tickDriver.stop()
 	if bs.workers == nil {
 		return
 	}
 	workers := bs.workers
 	bs.workers = nil
+	log.Info("splitCheckWorker")
 	workers.splitCheckWorker.Stop()
+	log.Info("regionWOrker")
 	workers.regionWorker.Stop()
+	log.Info("raftLogGcWorker")
 	workers.raftLogGCWorker.Stop()
+	log.Info("schedulerWorker")
 	workers.schedulerWorker.Stop()
+	log.Info("workers.wg")
 	workers.wg.Wait()
 }
 

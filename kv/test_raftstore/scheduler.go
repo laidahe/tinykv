@@ -298,6 +298,7 @@ func (m *MockSchedulerClient) handleHeartbeatVersion(region *metapb.Region) erro
 
 	for {
 		searchRegion, _ := m.getRegionLocked(region.GetStartKey())
+		log.Infof("searchRegion=%+v\nregion=%+v", searchRegion, region)
 		if searchRegion == nil {
 			m.addRegionLocked(region)
 			return nil
@@ -459,6 +460,12 @@ func (m *MockSchedulerClient) findRegion(key []byte) *regionItem {
 	item := &regionItem{region: metapb.Region{StartKey: key}}
 
 	var result *regionItem
+	// log.Infof("find region key=%s", key)
+	// m.regionsRange.AscendGreaterOrEqual(&regionItem{metapb.Region{StartKey: []byte{}}}, 
+	// 	func(i btree.Item) bool {
+	// 		log.Infof("btree range region=%+v", i.(*regionItem).region)
+	// 		return true
+	// })
 	m.regionsRange.DescendLessOrEqual(item, func(i btree.Item) bool {
 		result = i.(*regionItem)
 		return false
@@ -467,7 +474,7 @@ func (m *MockSchedulerClient) findRegion(key []byte) *regionItem {
 	if result == nil || !result.Contains(key) {
 		return nil
 	}
-
+	// log.Infof("ret region=%+v", result.region)
 	return result
 }
 

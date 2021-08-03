@@ -358,6 +358,16 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 	req := NewSnapCmd()
 	values := make([][]byte, 0)
 	key := start
+	id := rand.Int()
+	log.Infof("%d scan %s %s", id, start, end)
+
+	// defer func() {
+	// 	if err := recover(); err != nil {
+	// 		log.Infof("err=%v id=%d key=%s end=%s", err, id, key, end)
+	// 		panic(err)
+	// 	}
+	// } ()
+
 	for (len(end) != 0 && bytes.Compare(key, end) < 0) || (len(key) == 0 && len(end) == 0) {
 		resp, txn := c.Request(key, []*raft_cmdpb.Request{req}, 5*time.Second)
 		if resp.Header.Error != nil {
@@ -371,11 +381,13 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 		}
 		region := resp.Responses[0].GetSnap().Region
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
+		log.Infof("%d get region=%+v start scan %s", id, region, key)
 		for iter.Seek(key); iter.Valid(); iter.Next() {
 			if engine_util.ExceedEndKey(iter.Item().Key(), end) {
 				break
 			}
 			value, err := iter.Item().ValueCopy(nil)
+			log.Infof("%d key scan %s", id, value)
 			if err != nil {
 				panic(err)
 			}

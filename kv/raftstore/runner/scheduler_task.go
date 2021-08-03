@@ -57,7 +57,7 @@ func (r *SchedulerTaskHandler) Handle(t worker.Task) {
 	case *SchedulerStoreHeartbeatTask:
 		r.onStoreHeartbeat(t.(*SchedulerStoreHeartbeatTask))
 	default:
-		log.Error("unsupported worker.Task: %+v", t)
+		log.Errorf("SchedulerTask unsupported worker.Task: %+v", t)
 	}
 }
 

@@ -158,7 +158,7 @@ func (rn *RawNode) Ready() Ready {
 			rn.Raft.RaftLog.GetEntries(
 				rn.Raft.RaftLog.stabled + 1, rn.Raft.RaftLog.LastIndex() + 1, false)),
 		CommittedEntries: rn.Raft.RaftLog.GetNewCommit(),
-		Messages: rn.Raft.msgs,
+		Messages: rn.Raft.GetSendMsg(),
 		Snapshot: snapshot,
 	}
 }

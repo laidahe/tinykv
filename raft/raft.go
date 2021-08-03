@@ -190,18 +190,33 @@ func resetElapsed(elapsed *int, ticks *int, baseline int, randomized bool) {
 	*ticks = 0
 }
 
+func (r *Raft) newProgress(id uint64) *Progress {
+	if r.id == id {
+		return &Progress{Match: r.RaftLog.LastIndex(), Next: r.RaftLog.LastIndex() + 1}
+	} else {
+		return &Progress{Match: 0, Next: r.RaftLog.LastIndex() + 1}
+	}
+}
 
-func (r *Raft) initPrs(peers []uint64) {
+func (r *Raft) initPrs(peers []uint64, useOld bool) {
 	newPrs := make(map[uint64]*Progress)
 	for _, id := range peers {
-		p, exist := r.Prs[id]
-		if exist {
-			newPrs[id] = p
+		if Pr, exist := r.Prs[id]; useOld && exist {
+			newPrs[id] = Pr
 		} else {
-			newPrs[id] = &Progress{Match: 0, Next: r.RaftLog.LastIndex() + 1}
+			newPrs[id] = r.newProgress(id)
 		}
 	}
+//	newPrs[r.id] = r.newProgress(r.id)
 	r.Prs = newPrs
+}
+
+func (r *Raft) getPeersFromPrs() []uint64 {
+	ret := make([]uint64, 0)
+	for id := range r.Prs {
+		ret = append(ret, id)
+	}
+	return ret
 }
 
 // newRaft return a raft peer with the given config
@@ -221,6 +236,7 @@ func newRaft(c *Config) *Raft {
 		// For project2a
 		peers = c.peers
 	}
+	log.Infof("%d init Peers=%+v", c.ID, peers)
 	raft := &Raft{
 		id:               c.ID,
 		electionTimeout:  c.ElectionTick,
@@ -231,8 +247,9 @@ func newRaft(c *Config) *Raft {
 		Term:             hardState.Term,
 		SoftState: &SoftState{Lead: None, RaftState: StateFollower},
 		HardState: hardState,
+		msgs: make([]pb.Message, 0),
 	}
-	raft.initPrs(peers)
+	raft.initPrs(peers, false)
 	resetElapsed(&raft.electionElapsed, &raft.ticks, raft.electionTimeout, true)
 
 	return raft
@@ -258,18 +275,19 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if err != nil {
 		// prev entry isn't exist, maybe compact,
 		// so send snapshot
-		if r.RaftLog.pendingSnapshot == nil {
+		//if r.RaftLog.pendingSnapshot == nil {
 			// maybe node restart, so get a new snapshot
-			snap, err := r.RaftLog.storage.Snapshot()
+			snapshot, err := r.RaftLog.storage.Snapshot()
+			log.Infof("%d -> %d, index=%d not found, snapIndex,Term=%d:%d, pending=%+v",
+		 		r.id, to, prevIndex, r.RaftLog.snapIndex, r.RaftLog.snapTerm, snapshot)
 			if err != nil {
 				return false
 			}
-			// install snapshot for self
-			r.installSnapshot(&snap)
-		}
+		//	r.RaftLog.pendingSnapshot = &snap
+		//}
 		
 		r.sendMessage(to, pb.MessageType_MsgSnapshot, pb.Message{
-			Snapshot: r.RaftLog.pendingSnapshot,
+			Snapshot: &snapshot,
 		})
 		// for TestProvideSnap2C
 		return true
@@ -337,7 +355,7 @@ func (r *Raft) tick() {
 		}
 	case StateFollower:
 		if r.ticks == r.electionElapsed {
-			log.Infof("%d new election", r.id)
+			log.Infof("%d new election newTerm=%v", r.id, r.Term + 1)
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 		}
 	case StateCandidate:
@@ -368,7 +386,7 @@ func (r *Raft) checkVote() {
 		}
 		reject := len(r.grantVotes) - voteCnt
 		if voteCnt > len(r.Prs) / 2 {
-			log.Infof("%d voteCnt=%d, -> Leader", r.id, voteCnt)
+			log.Infof("%d voteCnt=%d, grantVotes=%+v, Prs=%+v, term=%v, -> Leader", r.id, voteCnt, r.grantVotes, r.Prs, r.Term)
 			r.becomeLeader()
 		} else if reject > len(r.Prs) / 2 {
 			r.becomeFollower(r.Term, None)
@@ -384,6 +402,7 @@ func (r *Raft) becomeCandidate() {
 	r.State = StateCandidate
 	r.grantVotes = make(map[uint64]bool)
 	r.grantVotes[r.id] = true
+	r.Vote = r.id
 	resetElapsed(&r.electionElapsed, &r.ticks, r.electionTimeout, true)
 	r.checkVote()
 }
@@ -392,19 +411,16 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	// If node was removed from group, it can't become leader
+	if _, exist := r.Prs[r.id]; !exist {
+		return
+	}
 	r.readyUpdated = true
 	r.State = StateLeader
 	resetElapsed(&r.heartbeatElapsed, &r.ticks, r.heartbeatTimeout, false)
 
 	// reinit Progress
-	for id, p := range r.Prs {
-		p.Next = r.RaftLog.LastIndex() + 1
-		if id != r.id {
-			p.Match = 0
-		} else {
-			p.Match = p.Next - 1
-		}
-	}
+	r.initPrs(r.getPeersFromPrs(), false)
 
 	// noop entry
 	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
@@ -420,6 +436,7 @@ func (r *Raft) Step(m pb.Message) error {
 
 	higherLogTerm := func(m pb.Message, equal bool) bool {
 		if m.Term > r.Term || (equal && m.Term == r.Term) {
+			log.Infof("%d become follower because msg=%+v", r.id, m)
 			r.becomeFollower(m.Term, None)
 			return true
 		}
@@ -492,10 +509,15 @@ func (r *Raft) Step(m pb.Message) error {
 				ent.Term = r.Term
 				if ent.EntryType == pb.EntryType_EntryConfChange {
 					if r.RaftLog.applied < r.PendingConfIndex {
+						r.sendAppendToOthers()
+						r.checkUpdateCommit()
+						log.Infof("ErrPendingConfChange, applied=%v, pendingConfIndex=%v", r.RaftLog.applied, r.PendingConfIndex)
 						return ErrPendingConfChange
 					}
+					log.Infof("new pendingConfIndex=%v", r.PendingConfIndex)
 					r.PendingConfIndex = ent.Index
 				}
+				log.Infof("new log term=%v, index=%v", ent.Term, ent.Index)
 			}
 			r.RaftLog.Append(lastIndex, m.Entries...)
 			// TestProgressLeader2AB need it, always make r.Prs[r.id].Match newest
@@ -546,6 +568,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	p := r.Prs[m.From]
+	// log.Infof("%d appendResp: to=%d Prs=%+v, lastIndex=%d snapIndex=%d snapTerm=%d",
+	//  r.id, m.From, p, r.RaftLog.LastIndex(), r.RaftLog.snapIndex, r.RaftLog.snapTerm)
 	if m.Reject {
 		p.Next--
 		// send Append at now
@@ -611,6 +635,8 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	r.sendMessage(m.From, pb.MessageType_MsgRequestVoteResponse, pb.Message{
 		Reject: reject,
 	})
+	log.Infof("%d from %v reject=%v vote=%v logTerm=%v index=%d lastIndex=%v Vote=%v",
+	 r.id, m.From, reject, r.Vote, m.LogTerm, m.Index, r.RaftLog.LastIndex(), r.Vote)
 	if !reject {
 		r.readyUpdated = true
 		r.Vote = m.From
@@ -619,7 +645,33 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	r.grantVotes[m.From] = !m.Reject
+	log.Infof("%d reject=%v from %v grantVotes=%v, Prs=%v",
+	 r.id, m.Reject, m.From, r.grantVotes, r.getPeersFromPrs())
 	r.checkVote()
+}
+
+func (r *Raft) GetSendMsg() []pb.Message {
+	type msgkey = struct {
+		to uint64
+		msgType pb.MessageType
+	}
+	msgMap := make(map[msgkey]*pb.Message)
+	ret := make([]pb.Message, 0)
+	for _, msg := range r.msgs {
+		if msg.MsgType == pb.MessageType_MsgSnapshot {
+			msgMap[msgkey{msg.To, msg.MsgType}] = &msg
+		} else {
+			ret = append(ret, msg)
+		}
+	}
+	for _, msg := range msgMap {
+		ret = append(ret, *msg)
+	}
+	if len(ret) == 0 {
+		return nil
+	}
+	//log.Infof("%d msgs=%+v\n filtermsg=%+v\n len=%d:%d", r.id, r.msgs, ret, len(r.msgs), len(ret))
+	return ret
 }
 
 func (r *Raft) HandleAdvance(rd Ready) {
@@ -638,6 +690,7 @@ func (r *Raft) HandleAdvance(rd Ready) {
 	}
 	// snapshot has applied
 	r.RaftLog.pendingSnapshot = nil
+	r.RaftLog.maybeCompact(r.id)
 }
 
 func (r *Raft) ReadyUpdated() bool {
@@ -676,21 +729,12 @@ func (r *Raft) GetID() uint64 {
 	return r.id
 }
 
-func (r *Raft) TrySnapshot() {
-	r.RaftLog.maybeCompact()
-	if r.RaftLog.pendingSnapshot == nil {
-		return
-	}
-	// installSnapshot for self
-	r.installSnapshot(r.RaftLog.pendingSnapshot)
-}
-
 
 func (r *Raft) installSnapshot(snap *pb.Snapshot) {
-	log.Infof("%d installSnapshot", r.id)
+	log.Infof("%d installSnapshot=%+v", r.id, snap)
 	r.RaftLog.InstallSnap(snap)
 	peers := snap.Metadata.ConfState.Nodes
-	r.initPrs(peers)
+	r.initPrs(peers, true)
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -699,15 +743,20 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	//reject
 	if m.Term < r.Term {
 		// let leader update term and become follower
-		r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{Reject: true})
+		r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{
+			Reject: true,
+			Term: r.Term,
+		})
 		return
 	}
 	r.installSnapshot(m.GetSnapshot())
+	log.Infof("after installSnapshot %d raftLog=%+v", r.id, r.RaftLog)
 	// we nned told leader that snapshot install finish
 	// and append following entries if any
 	r.sendMessage(m.From, pb.MessageType_MsgAppendResponse, pb.Message{
-		LogTerm: m.Snapshot.Metadata.Index,
+		//LogTerm: m.Snapshot.Metadata.Index,
 		Index: m.Snapshot.Metadata.Index,
+		Reject: false,
 	})
 }
 
@@ -730,12 +779,14 @@ func (r *Raft) checkTransferee() bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	r.Prs[id] = &Progress{Match: 0, Next: r.RaftLog.LastIndex()}
+	log.Infof("%d add node %d", r.id, id)
+	r.Prs[id] = r.newProgress(id)
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	log.Infof("%d rm node %d", r.id, id)
 	delete(r.Prs, id)
 	switch r.State {
 	case StateFollower:

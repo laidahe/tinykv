@@ -48,6 +48,8 @@ type PeerStorage struct {
 	Engines *engine_util.Engines
 	// Tag used for logging
 	Tag string
+
+	Scan func()
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
@@ -123,6 +125,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 		return buf, nil
 	}
 	// Here means we don't fetch enough entries.
+	log.Warnf("%s entries doesn't get low %v high %v", ps.Tag, low, high)
 	return nil, raft.ErrUnavailable
 }
 
@@ -203,6 +206,7 @@ func (ps *PeerStorage) Region() *metapb.Region {
 }
 
 func (ps *PeerStorage) SetRegion(region *metapb.Region) {
+	log.Infof("%s setRegion %+v\noldRegion %+v", ps.Tag, region, ps.region)
 	ps.region = region
 }
 
@@ -264,6 +268,10 @@ func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 	if bytes.Compare(newEndKey, oldEndKey) < 0 {
 		ps.clearRange(newRegion.Id, newEndKey, oldEndKey)
 	}
+	// // ExceedEndKey?
+	// if !engine_util.ExceedEndKey(newEndKey, oldEndKey) {
+	// 	ps.clearRange(newRegion.Id, newEndKey, oldEndKey)
+	// }
 }
 
 // ClearMeta delete stale metadata like raftState, applyState, regionState and raft log entries
@@ -320,9 +328,10 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		}
 	}
 	if len(entries) > 0 {
-		last := &entries[len(entries) - 1]
+		last := &entries[len(entries)-1]
 		ps.raftState.LastIndex = last.Index
-		ps.raftState.LastTerm = last.Term 
+		ps.raftState.LastTerm = last.Term
+		log.Infof("%s presist entries [%d:%d]", ps.Tag, entries[0].Index, last.Index)
 	}
 	return nil
 }
@@ -338,29 +347,49 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	if len(snapData.Data) == 0 {
+
+	if snapshot.Metadata == nil {
+		//	if len(snapData.Data) == 0 {
 		return nil, nil
 	}
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: snapshot.Metadata.Index, Term: snapshot.Metadata.Term}
+	if ps.raftState.LastIndex < snapshot.Metadata.Index {
+		ps.raftState.LastIndex = snapshot.Metadata.Index
+		ps.raftState.LastTerm = snapshot.Metadata.Term
+	}
 	log.Infof("turncatedIndex=%d", snapshot.Metadata.Index)
 	err := ps.clearMeta(kvWB, raftWB)
 	if err != nil {
 		return nil, err
 	}
-	ps.clearExtraData(snapData.GetRegion())
-	oldRegion :=  ps.region
-	ps.region = snapData.GetRegion()
+	//ps.clearExtraData(snapData.GetRegion())
+	oldRegion := ps.region
+	ps.SetRegion(snapData.GetRegion())
 	oldState := ps.snapState.StateType
 	ps.snapState.StateType = snap.SnapState_Applying
+	log.Infof("%v snapshot region %+v", ps.Tag, ApplySnapResult{oldRegion, ps.region})
 	ch := make(chan bool)
-	ps.regionSched <- runner.RegionTaskApply{
+	startKey := oldRegion.StartKey
+	endKey := oldRegion.EndKey
+	if bytes.Compare(ps.region.StartKey, startKey) > 0 {
+		startKey = ps.region.StartKey
+	}
+	if len(endKey) == 0 || bytes.Compare(ps.region.EndKey, endKey) < 0 {
+		endKey = ps.region.EndKey
+	}
+	log.Infof("%s snapshot apply clear range start %s end %s", ps.Tag, startKey, endKey)
+	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: ps.region.Id,
 		Notifier: ch,
 		SnapMeta: snapshot.Metadata,
+		StartKey: startKey,
+		EndKey: endKey,
 	}
-	<- ch
+	<-ch
 	ps.snapState.StateType = oldState
+	log.Infof("after snapshot, scan")
+	ps.Scan()
 	return &ApplySnapResult{oldRegion, ps.region}, nil
 }
 
@@ -377,20 +406,30 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if ready.HardState.Term > 0 {
 		ps.raftState.HardState = &ready.HardState
 	}
+	if ready.Snapshot.Metadata != nil {
+		ps.applyState.AppliedIndex = ready.Snapshot.Metadata.Index
+	}
 	if len(ready.CommittedEntries) > 0 {
-		ps.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries) - 1].Index
+		ps.applyState.AppliedIndex = max(ps.applyState.AppliedIndex,
+			ready.CommittedEntries[len(ready.CommittedEntries)-1].Index)
 	}
 	result, err := ps.ApplySnapshot(&ready.Snapshot, raftWB, kvWB)
 	if err != nil {
 		return nil, err
 	}
-	reginState := &rspb.RegionLocalState{State: rspb.PeerState_Normal, Region: ps.region}
-	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()),  ps.raftState)
+	regionState := &rspb.RegionLocalState{State: rspb.PeerState_Normal, Region: ps.region}
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
 	kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), ps.applyState)
-	kvWB.SetMeta(meta.RegionStateKey(ps.region.GetId()), reginState)
-	ps.Engines.WriteRaft(raftWB)
-	ps.Engines.WriteKV(kvWB)
-	
+	kvWB.SetMeta(meta.RegionStateKey(ps.region.GetId()), regionState)
+	err = ps.Engines.WriteRaft(raftWB)
+	if err != nil {
+		log.Panicf("saveReadyState: writeRaft err=%v", err)
+	}
+	err = ps.Engines.WriteKV(kvWB)
+	if err != nil {
+		log.Panicf("saveReadyState: writeKv err=%v", err)
+	}
+	log.Infof("%s save applyState %v", ps.Tag, ps.applyState)
 	return result, nil
 }
 
@@ -399,9 +438,17 @@ func (ps *PeerStorage) ClearData() {
 }
 
 func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
+	log.Infof("region=%v start clear key %s %s", ps.region, start, end)
 	ps.regionSched <- &runner.RegionTaskDestroy{
 		RegionId: regionID,
 		StartKey: start,
 		EndKey:   end,
 	}
+}
+
+func max(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }
