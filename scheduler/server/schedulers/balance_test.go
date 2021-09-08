@@ -73,6 +73,7 @@ func (s *testBalanceRegionSchedulerSuite) TestReplicas13C(c *C) {
 	// When store 1 is offline, it will be filtered,
 	// store 2 becomes the store with least regions.
 	testutil.CheckTransferPeerWithLeaderTransfer(c, sb.Schedule(tc), operator.OpBalance, 4, 2)
+	// Notice: Why?
 	opt.SetMaxReplicas(3)
 	c.Assert(sb.Schedule(tc), IsNil)
 

@@ -14,8 +14,12 @@
 package schedulers
 
 import (
+	"sort"
+
+	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
+	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/filter"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
 )
@@ -41,6 +45,7 @@ type balanceRegionScheduler struct {
 	*baseScheduler
 	name         string
 	opController *schedule.OperatorController
+	filters		 []filter.Filter
 }
 
 // newBalanceRegionScheduler creates a scheduler that tends to keep regions on
@@ -53,6 +58,10 @@ func newBalanceRegionScheduler(opController *schedule.OperatorController, opts .
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	s.filters = []filter.Filter{
+		filter.NewHealthFilter(s.GetName()),
+		filter.StoreStateFilter{ActionScope: s.GetName(), MoveRegion: true},
 	}
 	return s
 }
@@ -75,8 +84,71 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 	return s.opController.OperatorCount(operator.OpRegion) < cluster.GetRegionScheduleLimit()
 }
 
+// check whether the region movement is valuable
+func checkRegionMoveValuable(source *core.StoreInfo, target *core.StoreInfo, approximateSize int64) bool {
+	return source.GetRegionSize() - target.GetRegionSize() >= 2 * approximateSize
+}
+
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
+	stores := cluster.GetStores()
+	sources := filter.SelectSourceStores(stores, s.filters, cluster)
+	targets := filter.SelectTargetStores(stores, s.filters, cluster)
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].GetRegionSize() > sources[j].GetRegionSize()
+	})
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].GetRegionSize() < targets[j].GetRegionSize()
+	})
+	var selectedRegion *core.RegionInfo = nil
+	var source *core.StoreInfo = nil
+	//Notice: why we need check MaxReplicas
+	for _, source = range sources {
+		cb := func(rc core.RegionsContainer) {
+			selectedRegion = rc.RandomRegion([]byte(""), []byte(""))
+		}
+		cluster.GetPendingRegionsWithLock(source.GetID(), cb)
+		if selectedRegion == nil || len(selectedRegion.GetPeers()) < cluster.GetMaxReplicas() {
+			cluster.GetFollowersWithLock(source.GetID(), cb)
+		}
+		if selectedRegion == nil || len(selectedRegion.GetPeers()) < cluster.GetMaxReplicas() {
+			cluster.GetLeadersWithLock(source.GetID(), cb)
+		}
+		if selectedRegion != nil && len(selectedRegion.GetPeers()) >= cluster.GetMaxReplicas() {
+			break
+		}
+	}
 
-	return nil
+	log.Infof("select region=%+v source=%+v", selectedRegion, source)
+	if selectedRegion == nil {
+		log.Infof("select region empty")
+		return nil
+	}
+	selectedRegion.GetApproximateSize()
+	var target *core.StoreInfo = nil
+	for _, t := range targets {
+		if selectedRegion.GetStorePeer(t.GetID()) != nil {
+			continue
+		}
+		if checkRegionMoveValuable(source, t, selectedRegion.GetApproximateSize()) {
+			target = t
+			break
+		}
+	}
+	log.Infof("select target=%+v", target)
+	if target == nil {
+		log.Infof("select target empty")
+		return nil
+	}
+	newPeer, err := cluster.AllocPeer(target.GetID())
+	if err != nil {
+		log.Warn("allocPeer error", err)
+		return nil
+	}
+	op, err := operator.CreateMovePeerOperator(s.GetName(), cluster, selectedRegion,
+	 operator.OpBalance, source.GetID(), target.GetID(), newPeer.GetId())
+	if err != nil {
+		log.Warn("alloc operator error", err)
+	}
+	return op
 }

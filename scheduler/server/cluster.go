@@ -14,6 +14,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path"
@@ -276,10 +277,73 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 	return nil
 }
 
+// check A and B's epoch, return whether A < B
+func cmpRegion(regionA *core.RegionInfo, regionB *core.RegionInfo) bool {
+	if regionA == nil || regionB == nil {
+		return false
+	}
+	RegionAEpoch := regionA.GetRegionEpoch()
+	RegionBEpoch := regionB.GetRegionEpoch()
+	if RegionAEpoch == nil || RegionBEpoch == nil {
+		return false
+	}
+	return RegionAEpoch.ConfVer < RegionBEpoch.ConfVer || RegionAEpoch.Version < RegionBEpoch.Version
+}
+
+// check whether the heartbeat region info is stabled
+func (c *RaftCluster) IsStabledRegion(oldRegion *core.RegionInfo, region *core.RegionInfo) bool {
+	if cmpRegion(region, oldRegion) {
+		return true
+	}
+	for _, overlap := range c.core.GetOverlaps(region) {
+		if cmpRegion(region, overlap) {
+			return true
+		}
+	}
+	return false
+}
+
+// check whether the region info need to be update
+func (c *RaftCluster) regionNeedUpdate(oldRegion *core.RegionInfo, region *core.RegionInfo) bool {
+	if oldRegion == nil {
+		return true
+	}
+
+	if cmpRegion(region, oldRegion) {
+		return true
+	}
+	if region.GetLeader() != oldRegion.GetLeader() {
+		return true
+	}
+	if len(region.GetPendingPeers()) > 0 || len(oldRegion.GetPendingPeers()) > 0 {
+		return true
+	}
+	if region.GetApproximateSize() != oldRegion.GetApproximateSize() {
+		return true
+	}
+	if bytes.Compare(region.GetEndKey(), oldRegion.GetEndKey()) != 0 ||
+	 bytes.Compare(region.GetStartKey(), oldRegion.GetStartKey()) != 0 {
+		 return true
+	}
+	return false
+}
+
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
-
+	// check whether the new region info is stabled
+	oldRegion := c.core.GetRegion(region.GetID())
+	if c.IsStabledRegion(oldRegion, region) {
+		return ErrRegionIsStale(region.GetMeta(), oldRegion.GetMeta())
+	}
+	if !c.regionNeedUpdate(oldRegion, region) {
+		return nil
+	}
+	// update
+	c.core.PutRegion(region)
+	for _, region := range region.GetPeers() {
+		c.updateStoreStatusLocked(region.StoreId)
+	}
 	return nil
 }
 
