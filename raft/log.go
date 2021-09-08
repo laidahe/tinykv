@@ -56,6 +56,7 @@ type RaftLog struct {
 	readyUpdated bool
 	// save snapshot's last included Term and Index
 	snapIndex, snapTerm uint64
+	log func(string, ...interface{}) string
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -100,6 +101,12 @@ func newLog(storage Storage) *RaftLog {
 		snapTerm: snapTerm,
 		pendingSnapshot: snapshot,
 	}
+}
+
+func newLogWithLogFunc(s Storage, log func(string, ...interface{}) string) *RaftLog {
+	ret := newLog(s)
+	ret.log = log
+	return ret
 }
 
 // We need to compact the log entries in some point of time like

@@ -32,15 +32,19 @@ const (
 	PeerTickSchedulerHeartbeat PeerTick = 3
 )
 
+type LogFunc = func(string, ...interface{}) string
+
 type peerMsgHandler struct {
 	*peer
 	ctx *GlobalContext
+	log LogFunc
 }
 
 func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	return &peerMsgHandler{
 		peer: peer,
 		ctx:  ctx,
+		log: MakeFmtLog(peer.Tag, "PeerMsgHandler", true),
 	}
 }
 
@@ -78,12 +82,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			}
 
 			if reqs.AdminRequest == nil {
-				//log.Infof("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
-				tag := fmt.Sprintf("id %v store %v index %v",
-					d.PeerId(), d.storeID(), ent.Index)
-				resps := d.execute(reqs.Requests, cb, tag)
+				//d.log("%d state=%d apply index=%d term=%d\n", d.RaftGroup.Raft.GetID(), d.RaftGroup.Raft.State, ent.Index, ent.Term)
+				resps := d.execute(reqs.Requests, cb)
 				if cb != nil && resps != nil {
-					log.Infof("cb resp")
+					d.log("cb resp")
 					cb.Done(&raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}, Responses: resps})
 				}
 			} else {
@@ -120,7 +122,7 @@ func (d *peerMsgHandler) doCompactLog(req *raft_cmdpb.CompactLogRequest) {
 		Index: req.CompactIndex,
 		Term:  req.CompactTerm,
 	}
-	log.Infof("%s compactLog to index %d term %d", d.Tag, req.CompactIndex, req.CompactTerm)
+	d.log("%s compactLog to index %d term %d", d.Tag, req.CompactIndex, req.CompactTerm)
 	wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 	wb.WriteToDB(d.ctx.engine.Kv)
 	d.ScheduleCompactLog(req.CompactIndex)
@@ -236,11 +238,11 @@ func (d *peerMsgHandler) doSplitRegion(req *raft_cmdpb.SplitRequest, cb *message
 
 	region := &metapb.Region{}
 	util.CloneMsg(d.Region(), region)
-	log.Infof("%d splitRegion req=%+v", d.PeerId(), req)
+	d.log("%d splitRegion req=%+v", d.PeerId(), req)
 	if bytes.Compare(req.SplitKey, region.StartKey) < 0 ||
 		engine_util.ExceedEndKey(req.SplitKey, region.EndKey) {
 		// TODO ?
-		log.Info("region splitKey not in range[%v:%v] splitKey=%v ", region.StartKey,
+		d.log("region splitKey not in range[%v:%v] splitKey=%v ", region.StartKey,
 			region.EndKey, req.SplitKey)
 		return
 	}
@@ -255,7 +257,6 @@ func (d *peerMsgHandler) doSplitRegion(req *raft_cmdpb.SplitRequest, cb *message
 	}
 	raftWB := new(engine_util.WriteBatch)
 	kvWB := new(engine_util.WriteBatch)
-	//d.peerStorage.clearExtraData(region)
 
 	writeInitialApplyState(kvWB, newRegion.Id)
 	writeInitialRaftState(raftWB, newRegion.Id)
@@ -276,7 +277,7 @@ func (d *peerMsgHandler) doSplitRegion(req *raft_cmdpb.SplitRequest, cb *message
 	d.ctx.router.register(peer)
 	d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
 
-	log.Infof("%d region split origin=%+v\nnewRegion=%+v\n", d.PeerId(), region, newRegion)
+	d.log("%d region split origin=%+v\nnewRegion=%+v\n", d.PeerId(), region, newRegion)
 
 }
 
@@ -317,13 +318,13 @@ func (d *peerMsgHandler) getCallback(index, term uint64) *message.Callback {
 	return ret
 }
 
-func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callback, tag string) []*raft_cmdpb.Response {
+func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callback) []*raft_cmdpb.Response {
 	resps := make([]*raft_cmdpb.Response, 0)
 	kvWB := new(engine_util.WriteBatch)
 	//defer d.lookStore()
 	checkKeyExist := func(key []byte) bool {
 		if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
-			log.Infof("key %s not in peer=%v region=%v", key, d.PeerId(), d.Region())
+			d.log("key %s not in peer=%v region=%v", key, d.PeerId(), d.Region())
 			if cb != nil {
 				cb.Done(ErrResp(err))
 			}
@@ -333,7 +334,7 @@ func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callbac
 	}
 
 	for _, req := range reqs {
-		log.Infof("%d store %d apply cmd=%+v\n", d.RaftGroup.Raft.GetID(), d.storeID(), req)
+		d.log("%d store %d apply cmd=%+v\n", d.RaftGroup.Raft.GetID(), d.storeID(), req)
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
 			get := req.GetGet()
@@ -343,7 +344,7 @@ func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callbac
 			txn := d.ctx.engine.Kv.NewTransaction(false)
 			val, err := engine_util.GetCFFromTxn(txn, get.GetCf(), get.GetKey())
 			if err != nil {
-				log.Infof("Get key %s not found", req.Get.Key)
+				d.log("Get key %s not found", req.Get.Key)
 				if cb != nil {
 					cb.Done(ErrResp(&util.ErrKeyNotInRegion{
 						Key:    get.GetKey(),
@@ -353,7 +354,7 @@ func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callbac
 				return nil
 			}
 
-			log.Infof("Get key %s value %s", req.Get.GetKey(), val)
+			d.log("Get key %s value %s", req.Get.GetKey(), val)
 			resps = append(resps, &raft_cmdpb.Response{
 				CmdType: raft_cmdpb.CmdType_Get,
 				Get: &raft_cmdpb.GetResponse{
@@ -365,7 +366,7 @@ func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callbac
 			if !checkKeyExist(put.GetKey()) {
 				return nil
 			}
-			log.Infof("%s put key %s val %s", tag, put.Key, put.Value)
+			d.log("put key %s val %s", put.Key, put.Value)
 			kvWB.SetCF(put.GetCf(), put.GetKey(), put.GetValue())
 			resps = append(resps, &raft_cmdpb.Response{
 				CmdType: raft_cmdpb.CmdType_Put,
@@ -376,7 +377,7 @@ func (d *peerMsgHandler) execute(reqs []*raft_cmdpb.Request, cb *message.Callbac
 			if !checkKeyExist(Del.GetKey()) {
 				return nil
 			}
-			log.Infof("%s delete key %s", tag, Del.Key)
+			d.log("delete key %s", Del.Key)
 			kvWB.DeleteCF(Del.GetCf(), Del.GetKey())
 			resps = append(resps, &raft_cmdpb.Response{
 				CmdType: raft_cmdpb.CmdType_Delete,
@@ -416,7 +417,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		d.onTick()
 	case message.MsgTypeSplitRegion:
 		split := msg.Data.(*message.MsgSplitRegion)
-		log.Infof("%s on split with %v", d.Tag, split.SplitKey)
+		d.log("%s on split with %v", d.Tag, split.SplitKey)
 		d.onPrepareSplitRegion(split.RegionEpoch, split.SplitKey, split.Callback)
 	case message.MsgTypeRegionApproximateSize:
 		d.onApproximateRegionSize(msg.Data.(uint64))
@@ -465,10 +466,10 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	log.Infof("%s get request=%+v", d.Tag, msg)
+	d.log("%s get request=%+v", d.Tag, msg)
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
-		log.Infof("%s sumbit req fail: %v", d.Tag, err)
+		d.log("%s sumbit req fail: %v", d.Tag, err)
 		cb.Done(ErrResp(err))
 		return
 	}
@@ -496,7 +497,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				if adminReq.ChangePeer.ChangeType == eraftpb.ConfChangeType_AddNode {
 					d.peer.insertPeerCache(adminReq.ChangePeer.Peer)
 				}
-				log.Infof("region=%+v", d.Region())
+				d.log("region=%+v", d.Region())
 			}
 		default:
 			data, _ := msg.Marshal()
@@ -663,11 +664,11 @@ func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	}
 	target := msg.GetToPeer()
 	if target.Id < d.PeerId() {
-		log.Infof("%s target peer ID %d is less than %d, msg maybe stale", d.Tag, target.Id, d.PeerId())
+		d.log("%s target peer ID %d is less than %d, msg maybe stale", d.Tag, target.Id, d.PeerId())
 		return true
 	} else if target.Id > d.PeerId() {
 		if d.MaybeDestroy() {
-			log.Infof("%s is stale as received a larger peer %s, destroying", d.Tag, target)
+			d.log("%s is stale as received a larger peer %s, destroying", d.Tag, target)
 			d.destroyPeer()
 			d.ctx.router.sendStore(message.NewMsg(message.MsgTypeStoreRaftMessage, msg))
 		}
@@ -706,10 +707,10 @@ func (d *peerMsgHandler) handleGCPeerMsg(msg *rspb.RaftMessage) {
 		return
 	}
 	if !util.PeerEqual(d.Meta, msg.ToPeer) {
-		log.Infof("%s receive stale gc msg, ignore", d.Tag)
+		d.log("%s receive stale gc msg, ignore", d.Tag)
 		return
 	}
-	log.Infof("%s peer %s receives gc message, trying to remove", d.Tag, msg.ToPeer)
+	d.log("%s peer %s receives gc message, trying to remove", d.Tag, msg.ToPeer)
 	if d.MaybeDestroy() {
 		d.destroyPeer()
 	}
@@ -993,5 +994,19 @@ func MakeScan(store uint64, kv *badger.DB) func() {
 		}
 		s += fmt.Sprintf("key count=%v", cnt)
 		log.Info(s)
+	}
+}
+
+func MakeFmtLog(tag string, component string, output bool) func(string, ...interface{}) string {
+	if output {
+		return func(s string, i ...interface{}) string {
+			s = fmt.Sprintf("%s:[%s] %s", tag, component, s)
+			log.Infof(s, i...)
+			return s
+		}
+	} else {
+		return func (s string, i ...interface{}) string {
+			return fmt.Sprintf(fmt.Sprintf("%s:[%s] %s\n", tag, component, s), i...)
+		}
 	}
 }
